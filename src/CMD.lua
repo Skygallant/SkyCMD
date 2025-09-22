@@ -21,6 +21,7 @@ local tele_name, tele_posStr = "",""
 local enviro = ((unit.getAtmosphereDensity() or 0) > 0)
 local printDebug = false
 local AllowAtmo = false --export: Allow autopilot near planets (<= 400 km from surface)
+local StopDist = 9
 -- Auto Pilot
 local autoAlign = false
 local autoBrake = false
@@ -106,6 +107,30 @@ local __ap_warpCheckCooldown = 0.5
 local __ap_lastWarpCheck = 0
 -- Stop rotation flag when coming to a stop
 local __stopRot = false
+-- Gentle approach params (space only)
+local __ap_approachSpeedKmh = 250
+local __ap_approachStopKm = 0
+
+
+-- Return true if a world position is outside all atmospheres in the current dest system
+local function isWorldInSpace(systemId, worldPos)
+    local sys = atlas[systemId]
+    if not sys or not worldPos then return true end
+    local nearestD2, nearestAtmoR = math.huge, 0
+    for _, body in pairs(sys) do
+        local c = body and body.center
+        if c then
+            local d = v3sub(worldPos, c)
+            local d2 = d:dot(d)
+            if d2 < nearestD2 then
+                nearestD2 = d2
+                nearestAtmoR = (body.hasAtmosphere and body.atmosphereRadius) or (body.radius or 0)
+            end
+        end
+    end
+    if nearestD2 == math.huge then return true end
+    return math.sqrt(nearestD2) > (nearestAtmoR + 1.0)
+end
 
 local function __ap_reset()
     __ap_active = false
@@ -166,7 +191,12 @@ local function __ap_start()
     -- Distance snapshot
     local pos = vec3(construct.getWorldPosition())
     __ap_initialDistM = v3sub(__destPos, pos):len()
-    __ap_halfDistM = __ap_initialDistM * 0.5
+    __ap_halfDistM = __ap_initialDistM * 0.6
+    -- If destination is already very close in space, skip main burn and go straight to gentle approach
+    if __ap_initialDistM <= 20000 and tele_sysId and isWorldInSpace(tele_sysId, __destPos) then
+        __ap_phase = 'approach_align'
+        dprint('Autopilot: short hop (<20 km), gentle approach')
+    end
 
     -- Prepare ship state
     autoAlign = true
@@ -263,25 +293,6 @@ local function findBodyByName(name)
     return nil
 end
 
--- Return true if a world position is outside all atmospheres in the current dest system
-local function isWorldInSpace(systemId, worldPos)
-    local sys = atlas[systemId]
-    if not sys or not worldPos then return true end
-    local nearestD2, nearestAtmoR = math.huge, 0
-    for _, body in pairs(sys) do
-        local c = body and body.center
-        if c then
-            local d = v3sub(worldPos, c)
-            local d2 = d:dot(d)
-            if d2 < nearestD2 then
-                nearestD2 = d2
-                nearestAtmoR = (body.hasAtmosphere and body.atmosphereRadius) or (body.radius or 0)
-            end
-        end
-    end
-    if nearestD2 == math.huge then return true end
-    return math.sqrt(nearestD2) > (nearestAtmoR + 1.0)
-end
 
 -- Return true if a world position is within 400 km of any body surface in the given system
 isWithin400kmOfBody = function(systemId, worldPos)
@@ -349,6 +360,32 @@ end
 -- Handle chat input to set destination
 system:onEvent('onInputText', function(self, text)
     if type(text) ~= 'string' then return end
+
+    -- Warp command: user-triggered validation and initiate
+    do
+        local trimmed = text:match('^%s*(.-)%s*$')
+        if trimmed and trimmed:lower() == 'warp' then
+            -- Only allow warp when AllowAtmo is true and warp drive is ready
+            if not AllowAtmo then
+                dprint('COMMAND REJECTED')
+                return
+            end
+            local ready = false
+            if warp and warp.getStatus then
+                local ok, st = pcall(warp.getStatus)
+                if ok and st == 15 then ready = true end
+            end
+            if ready and warp and warp.initiate then
+                dprint('COMMAND ACCEPTED')
+                dprint('Warp: initiating (user command)')
+                pcall(function() warp.initiate() end)
+                __ap_warpTriggered = true
+            else
+                dprint('COMMAND REJECTED')
+            end
+            return
+        end
+    end
 
     -- Emergency: allstop
     do
@@ -797,15 +834,10 @@ system:onEvent('onFlush', function (self)
         local longitudinalAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromThrottle(longitudinalEngineTags,axisCommandId.longitudinal)
         Nav:setEngineForceCommand(longitudinalEngineTags, longitudinalAcceleration, keepCollinearity)
     elseif  (longitudinalCommandType == axisCommandType.byTargetSpeed) then
-        local longitudinalAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromTargetSpeed(axisCommandId.longitudinal)
-        autoNavigationEngineTags = autoNavigationEngineTags .. ' , ' .. longitudinalEngineTags
-        autoNavigationAcceleration = autoNavigationAcceleration + longitudinalAcceleration
-        if (Nav.axisCommandManager:getTargetSpeed(axisCommandId.longitudinal) == 0 or -- we want to stop
-            Nav.axisCommandManager:getCurrentToTargetDeltaSpeed(axisCommandId.longitudinal) < - Nav.axisCommandManager:getTargetSpeedCurrentStep(axisCommandId.longitudinal) * 0.5) -- if the longitudinal velocity would need some braking
-        then
-            autoNavigationUseBrake = true
-        end
-
+        -- Force byThrottle composition; do not use target-speed mode
+        unit.setupAxisCommandProperties(axisCommandId.longitudinal, axisCommandType.byThrottle, nil)
+        local longitudinalAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromThrottle(longitudinalEngineTags,axisCommandId.longitudinal)
+        Nav:setEngineForceCommand(longitudinalEngineTags, longitudinalAcceleration, keepCollinearity)
     end
 
     -- Lateral Translation
@@ -815,9 +847,9 @@ system:onEvent('onFlush', function (self)
         local lateralStrafeAcceleration =  Nav.axisCommandManager:composeAxisAccelerationFromThrottle(lateralStrafeEngineTags,axisCommandId.lateral)
         Nav:setEngineForceCommand(lateralStrafeEngineTags, lateralStrafeAcceleration, keepCollinearity)
     elseif  (lateralCommandType == axisCommandType.byTargetSpeed) then
-        local lateralAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromTargetSpeed(axisCommandId.lateral)
-        autoNavigationEngineTags = autoNavigationEngineTags .. ' , ' .. lateralStrafeEngineTags
-        autoNavigationAcceleration = autoNavigationAcceleration + lateralAcceleration
+        unit.setupAxisCommandProperties(axisCommandId.lateral, axisCommandType.byThrottle, nil)
+        local lateralStrafeAcceleration =  Nav.axisCommandManager:composeAxisAccelerationFromThrottle(lateralStrafeEngineTags,axisCommandId.lateral)
+        Nav:setEngineForceCommand(lateralStrafeEngineTags, lateralStrafeAcceleration, keepCollinearity)
     end
 
     -- Vertical Translation
@@ -827,9 +859,9 @@ system:onEvent('onFlush', function (self)
         local verticalStrafeAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromThrottle(verticalStrafeEngineTags,axisCommandId.vertical)
         Nav:setEngineForceCommand(verticalStrafeEngineTags, verticalStrafeAcceleration, keepCollinearity, 'airfoil', 'ground', '', tolerancePercentToSkipOtherPriorities)
     elseif  (verticalCommandType == axisCommandType.byTargetSpeed) then
-        local verticalAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromTargetSpeed(axisCommandId.vertical)
-        autoNavigationEngineTags = autoNavigationEngineTags .. ' , ' .. verticalStrafeEngineTags
-        autoNavigationAcceleration = autoNavigationAcceleration + verticalAcceleration
+        unit.setupAxisCommandProperties(axisCommandId.vertical, axisCommandType.byThrottle, nil)
+        local verticalStrafeAcceleration = Nav.axisCommandManager:composeAxisAccelerationFromThrottle(verticalStrafeEngineTags,axisCommandId.vertical)
+        Nav:setEngineForceCommand(verticalStrafeEngineTags, verticalStrafeAcceleration, keepCollinearity, 'airfoil', 'ground', '', tolerancePercentToSkipOtherPriorities)
     end
 
     -- Auto Navigation (Cruise Control)
@@ -847,6 +879,13 @@ system:onEvent('onUpdate', function (self)
     enviro = ((unit.getAtmosphereDensity() or 0) > 0)
     local v = vec3(construct.getWorldVelocity())
     shipspeed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    -- Stopping criteria (forward speed and angular speed)
+    local fwdVec = vec3(construct.getWorldOrientationForward())
+    local forwardSpeed = math.abs(v:dot(fwdVec))
+    local angSpeed = vec3(construct.getWorldAngularVelocity()):len()
+    local function fullyStopped()
+        return (forwardSpeed <= 0.5) and (angSpeed <= 0.5)
+    end
     mass = construct.getTotalMass() or 0
     local function nz(x) return (x ~= nil) and x or 0 end
     local function finite(x) return x == x and x ~= math.huge and x ~= -math.huge end
@@ -875,7 +914,7 @@ system:onEvent('onUpdate', function (self)
 
     if __destPos then
         if isWorldInSpace(tele_sysId, __destPos) then
-            if autoBrake and math.floor(distKm) < math.ceil(brakedist/1000) + 9 and shipspeed > 10 then --kilometers
+            if autoBrake and math.floor(distKm) < math.ceil(brakedist/1000) + StopDist and shipspeed > 10 then --kilometers
                 brakeInput = 1
             elseif autoBrake and (shipspeed <= 0.5) then
                 brakeInput = 0
@@ -895,26 +934,7 @@ system:onEvent('onUpdate', function (self)
     if __ap_active and __destPos and not enviro then
         local now = nowTime()
 
-        -- Periodic warp check when allowed: if destination is within 400km of a body
-        -- and warp status is ready (15), initiate warp once
-        if AllowAtmo and (not __ap_warpTriggered) and tele_sysId then
-            if (now - (__ap_lastWarpCheck or 0)) >= (__ap_warpCheckCooldown or 0.5) then
-                __ap_lastWarpCheck = now
-                local nearBody = isWithin400kmOfBody(tele_sysId, __destPos)
-                local canWarp = false
-                if warp and warp.getStatus then
-                    local ok, st = pcall(warp.getStatus)
-                    if ok and st == 15 then canWarp = true end
-                end
-                if nearBody and canWarp and warp and warp.initiate then
-                    dprint('Warp: initiating (dest near body, status=15)')
-                    pcall(function()
-                        warp.initiate()
-                    end)
-                    __ap_warpTriggered = true
-                end
-            end
-        end
+        -- User-issued warp command handles warp validation; no periodic check here
 
         -- Helper: angle error (deg) between forward and destination vector
         local function angleToDestDeg()
@@ -981,8 +1001,48 @@ system:onEvent('onUpdate', function (self)
 
         elseif __ap_phase == 'brake' then
             __stopRot = true
-            -- Wait until the built-in autoBrake logic completes and we are stopped
-            if not autoBrake then
+            -- When nearly stopped, optionally run gentle approach in space, else exit
+            if fullyStopped() then
+                if tele_sysId and isWorldInSpace(tele_sysId, __destPos) then
+                    __ap_phase = 'approach_align'
+                    __ap_alignHoldSince = 0
+                    autoAlign = true
+                    dprint('Autopilot: gentle approach setup')
+                else
+                    autoAlign = false
+                    __ap_phase = 'done'
+                    dprint('Autopilot: arrived; exiting seat')
+                    dprint('COMMAND COMPLETED')
+                    pcall(function()
+                        __ap_setThrottle01(0)
+                        unit.exit()
+                    end)
+                    __ap_reset()
+                end
+            end
+
+        elseif __ap_phase == 'approach_align' then
+            -- Re-align precisely before gentle approach thrust
+            autoAlign = true
+            local tolDeg = 1.0
+            if angleToDestDeg() <= tolDeg then
+                if __ap_alignHoldSince == 0 then __ap_alignHoldSince = now end
+                if (now - __ap_alignHoldSince) >= 0.3 then
+                    -- Do not use target-speed mode; throttle-limited gentle approach
+                    __ap_setThrottle01(1) -- engage throttle to start approach
+                    __ap_phase = 'approach'
+                    dprint('Autopilot: gentle approach (<=200 km/h) with autobrake')
+                end
+            else
+                __ap_alignHoldSince = 0
+            end
+
+        elseif __ap_phase == 'approach' then
+            -- Keep aligning lightly and let autobrake stop near the target; cap speed without target-speed
+            autoAlign = true
+            local distNowKm = (distanceToDestM() / 1000)
+            if not autoBrake and distNowKm <= (1) and fullyStopped() then
+                -- Stop complete: exit
                 autoAlign = false
                 __ap_phase = 'done'
                 dprint('Autopilot: arrived; exiting seat')
@@ -992,6 +1052,17 @@ system:onEvent('onUpdate', function (self)
                     unit.exit()
                 end)
                 __ap_reset()
+            end
+            if distNowKm <= (2) and shipspeed > 20 then
+                __ap_setThrottle01(0)
+                StopDist = __ap_approachStopKm -- Stop at this many km from destination
+                autoBrake = true
+            end
+            local cap_ms = (__ap_approachSpeedKmh / 3.6)
+            if shipspeed > cap_ms then
+                __ap_setThrottle01(0)
+                StopDist = __ap_approachStopKm -- Stop at this many km from destination
+                autoBrake = true
             end
         else
             __stopRot = false
@@ -1004,7 +1075,7 @@ system:onEvent('onUpdate', function (self)
         __ap_setThrottle01(0)
         autoAlign = false
         brakeInput = 1
-        if shipspeed <= 0.5 then
+        if fullyStopped() then
             brakeInput = 0
             __emg_allstop_active = false
             __stopRot = false

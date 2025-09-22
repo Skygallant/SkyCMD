@@ -13,11 +13,9 @@ Commands are similiar in usage to my HUD based setup, [SkyHUD](https://github.co
 * Prefix the destination with a single worded name to save that destination to the databank.
 * Type the name of a destination to recall it.
 * Type "list" to recall all known destinations.
-* type "allstop" to commence emergency braking procedures
-The ship will immediately make a "as the crow flies" route towards that destination, **this means that currently the script is only suited for space travel**.
-
-## Warping
-If your destination is withing 2SU of a planetary body, the ship will periodically check for a warp destination. If it finds one it will initiate warp. Currently, the search only includes atlas bodies, but the warp initiation portion will accept any warp point.
+* Type "allstop" to commence emergency braking procedures
+* Type "warp" to attempt to initiate warp to the current warp destination (if one exists)
+The ship will immediately make an "as the crow flies" route towards that destination, **this means that currently the script is only suited for space travel**.
 
 ## Compiling
 * Run du-lua build to output the .conf file for use in control units, in-game.

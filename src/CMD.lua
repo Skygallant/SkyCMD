@@ -21,6 +21,7 @@ local tele_name, tele_posStr = "",""
 local enviro = ((unit.getAtmosphereDensity() or 0) > 0)
 local printDebug = false
 local AllowAtmo = false --export: Allow autopilot near planets (<= 400 km from surface)
+local FuelForBurn = 60 --export: the amount of fuel required to get up to sufficient speed for space travel (in metric tonnes)
 local StopDist = 9
 -- Auto Pilot
 local autoAlign = false
@@ -87,6 +88,65 @@ local function nowTime()
         if type(t) == 'number' then return t end
     end
     return 0
+end
+
+-- Return total mass (kg) of space fuel across all linked Space Fuel Tanks
+local function getTotalSpaceFuelKg()
+    local total = 0
+    local seen = {}
+    if core and core.getElementIdList and (core.getElementDisplayNameById or core.getElementTypeById) then
+        local okIds, ids = pcall(core.getElementIdList)
+        if okIds and type(ids) == 'table' then
+            for _, id in pairs(ids) do
+                if not seen[id] then
+                    local typeName = nil
+                    if core.getElementDisplayNameById then
+                        local okDisp, dispName = pcall(core.getElementDisplayNameById, id)
+                        if okDisp then typeName = dispName end
+                    elseif core.getElementTypeById then
+                        local okType, typName = pcall(core.getElementTypeById, id)
+                        if okType then typeName = typName end
+                    end
+                    if type(typeName) == 'string' then
+                        local lname = typeName:lower()
+                        if lname:find('space') and lname:find('fuel') and lname:find('tank') then
+                            -- Estimate content mass from element mass minus dry mass (from item data)
+                            local contentKg = 0
+                            local okMass, elemMass = false, nil
+                            if core.getElementMassById then
+                                okMass, elemMass = pcall(core.getElementMassById, id)
+                            end
+                            local dryKg = 0
+                            if core.getElementItemIdById and system.getItem then
+                                local okItemId, itemId = pcall(core.getElementItemIdById, id)
+                                if okItemId and itemId then
+                                    local okItem, item = pcall(system.getItem, itemId)
+                                    if okItem and type(item) == 'table' then
+                                        dryKg = tonumber(item.unitMass or item.mass or 0) or 0
+                                    end
+                                end
+                            end
+                            if okMass and type(elemMass) == 'number' then
+                                contentKg = math.max(0, elemMass - (dryKg or 0))
+                            end
+                            total = total + (contentKg or 0)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return total
+end
+
+-- Return true if at least the given mass (t) of space fuel is available
+local function hasMinSpaceFuelKg(minT)
+    local minKg = minT * 1000
+    local totalKg = 0
+    local ok, res = pcall(getTotalSpaceFuelKg)
+    if ok and type(res) == 'number' then totalKg = res end
+    return totalKg >= (minKg or 0)
 end
 
 -- Autopilot state for destination engagement
@@ -172,6 +232,7 @@ local function __ap_start()
         dprint('Autopilot: not starting in atmosphere')
         return
     end
+
     -- Proximity safety: reject destinations near planets when AllowAtmo=false
     if not AllowAtmo then
         if tele_sysId and isWithin400kmOfBody(tele_sysId, __destPos) then
@@ -179,14 +240,6 @@ local function __ap_start()
             return
         end
     end
-    __ap_active = true
-    __ap_phase = 'align'
-    __ap_startedAt = nowTime()
-    __ap_alignHoldSince = 0
-    __ap_lastSpeed = 0
-    __ap_speedStableSince = 0
-    __ap_warpTriggered = false
-    __ap_lastWarpCheck = 0
 
     -- Distance snapshot
     local pos = vec3(construct.getWorldPosition())
@@ -196,7 +249,24 @@ local function __ap_start()
     if __ap_initialDistM <= 20000 and tele_sysId and isWorldInSpace(tele_sysId, __destPos) then
         __ap_phase = 'approach_align'
         dprint('Autopilot: short hop (<20 km), gentle approach')
+    else
+        -- Enforce minimum space fuel requirement (60t)
+        if not hasMinSpaceFuelKg(FuelForBurn) then
+            dprint('COMMAND REJECTED')
+            dprint('Insufficient space fuel (<60t)')
+            return
+        end
     end
+
+    
+    __ap_active = true
+    __ap_phase = 'align'
+    __ap_startedAt = nowTime()
+    __ap_alignHoldSince = 0
+    __ap_lastSpeed = 0
+    __ap_speedStableSince = 0
+    __ap_warpTriggered = false
+    __ap_lastWarpCheck = 0
 
     -- Prepare ship state
     autoAlign = true

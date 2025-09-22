@@ -6,3 +6,4 @@ out
 util/
 node_modules/
 *.code-workspace
+util/Codex.lua

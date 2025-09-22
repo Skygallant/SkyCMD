@@ -2,33 +2,19 @@
   "cli": {
     "fmtVersion": 5
   },
-  "name": "SkyHUD",
-  "description": "An immersive fighter HUD for first person flying.",
+  "name": "Sky",
+  "description": "A Ship Computer fit for the Enterprise!",
   "sourcePath": "src",
   "outputPath": "out",
-  "libs": [
-    {
-      "id": "AR_Library",
-      "type": "raw",
-      "path": "libs/@EasternGamer/AR-Library",
-      "remote": {
-        "git": "https://github.com/EasternGamer/AR-Library.git"
-      }
-    }
-  ],
+  "libs": [],
   "builds": [
     {
-      "name": "main",
+      "name": "CMD",
       "type": "control",
       "slots": [
         {
-          "name": "altimeter",
-          "type": "telemeter"
-        },
-        {
           "name": "core",
-          "type": "core",
-          "events": []
+          "type": "core"
         },
         {
           "name": "disk",
@@ -45,7 +31,7 @@
     {
       "name": "custom",
       "handleErrors": true,
-      "minify": true,
+      "minify": false,
       "stripComments": true,
       "variables": {}
     }

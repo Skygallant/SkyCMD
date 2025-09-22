@@ -4,6 +4,7 @@ local rollInput = 0
 local yawInput = 0
 local brakeInput = 0
 local brakedist = 0
+local mass = 0
 local distKm = 0
 local constructVelocity = {0,0,0}
 local velocity = 0
@@ -846,6 +847,20 @@ system:onEvent('onUpdate', function (self)
     enviro = ((unit.getAtmosphereDensity() or 0) > 0)
     local v = vec3(construct.getWorldVelocity())
     shipspeed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
+    mass = construct.getTotalMass() or 0
+    local function nz(x) return (x ~= nil) and x or 0 end
+    local function finite(x) return x == x and x ~= math.huge and x ~= -math.huge end
+
+    local force = construct.getCurrentBrake()
+    if force == nil or force <= 0 then force = construct.getMaxBrake() or 0 end
+
+    local vx, vy, vz = nz(constructVelocity and constructVelocity.x),
+                    nz(constructVelocity and constructVelocity.y),
+                    nz(constructVelocity and constructVelocity.z)
+
+    local s2 = vx*vx + vy*vy + vz*vz
+    local brakespeed = (s2 >= 0 and finite(s2)) and math.sqrt(s2) or 0
+    brakedist = math.floor(mass * brakespeed * brakespeed) / (2 * force)
 
     if enviro then
         autoAlign = false
@@ -967,7 +982,7 @@ system:onEvent('onUpdate', function (self)
         elseif __ap_phase == 'brake' then
             __stopRot = true
             -- Wait until the built-in autoBrake logic completes and we are stopped
-            if not autoBrake and (shipspeed <= 0.5) then
+            if not autoBrake and (shipspeed <= 1) then
                 autoAlign = false
                 __ap_phase = 'done'
                 dprint('Autopilot: arrived; exiting seat')
@@ -989,7 +1004,7 @@ system:onEvent('onUpdate', function (self)
         __ap_setThrottle01(0)
         autoAlign = false
         brakeInput = 1
-        if shipspeed <= 0.5 then
+        if shipspeed <= 1 then
             brakeInput = 0
             __emg_allstop_active = false
             __stopRot = false

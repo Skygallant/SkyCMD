@@ -877,16 +877,16 @@ system:onEvent('onUpdate', function (self)
         if isWorldInSpace(tele_sysId, __destPos) then
             if autoBrake and math.floor(distKm) < math.ceil(brakedist/1000) + 9 and shipspeed > 10 then --kilometers
                 brakeInput = 1
-            --elseif autoBrake and shipspeed == 0 then
-            --    brakeInput = 0
-            --    autoBrake = false
+            elseif autoBrake and (shipspeed <= 0.5) then
+                brakeInput = 0
+                autoBrake = false
             end
         else
             if autoBrake and math.floor(distanceToDestAtmosphere()) < math.ceil(brakedist+49000) and shipspeed > 10 then --meters
                 brakeInput = 1
-            --elseif autoBrake and shipspeed == 0 then
-            --    brakeInput = 0
-            --    autoBrake = false
+            elseif autoBrake and (shipspeed <= 0.5) then
+                brakeInput = 0
+                autoBrake = false
             end
         end
     end
@@ -982,7 +982,7 @@ system:onEvent('onUpdate', function (self)
         elseif __ap_phase == 'brake' then
             __stopRot = true
             -- Wait until the built-in autoBrake logic completes and we are stopped
-            if not autoBrake and (shipspeed <= 1) then
+            if not autoBrake then
                 autoAlign = false
                 __ap_phase = 'done'
                 dprint('Autopilot: arrived; exiting seat')
@@ -1004,7 +1004,7 @@ system:onEvent('onUpdate', function (self)
         __ap_setThrottle01(0)
         autoAlign = false
         brakeInput = 1
-        if shipspeed <= 1 then
+        if shipspeed <= 0.5 then
             brakeInput = 0
             __emg_allstop_active = false
             __stopRot = false

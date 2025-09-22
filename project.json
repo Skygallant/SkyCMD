@@ -31,7 +31,7 @@
     {
       "name": "custom",
       "handleErrors": true,
-      "minify": false,
+      "minify": true,
       "stripComments": true,
       "variables": {}
     }

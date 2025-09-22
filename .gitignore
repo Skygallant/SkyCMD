@@ -1,9 +1,8 @@
 libs/
 temp/
-out/
-util/Codex.lua
-out
 util/
 node_modules/
 *.code-workspace
+*.yaml
+*.json
 util/Codex.lua

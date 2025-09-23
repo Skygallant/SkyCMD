@@ -23,6 +23,15 @@
         {
           "name": "warp",
           "type": "warpDrive"
+        },
+        {
+          "name": "scope",
+          "type": "radar",
+          "events": [
+            "onEnter",
+            "onLeave",
+            "onIdentified"
+          ]
         }
       ]
     }

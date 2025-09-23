@@ -21,8 +21,9 @@ local tele_name, tele_posStr = "",""
 local enviro = ((unit.getAtmosphereDensity() or 0) > 0)
 local printDebug = false
 local AllowAtmo = false --export: Allow autopilot near planets (<= 400 km from surface)
-local FuelForBurn = 60 --export: the amount of fuel required to get up to sufficient speed for space travel (in metric tonnes)
-local StopDist = 9
+local FuelForBurn = 40 --export: the amount of fuel required to get up to sufficient speed for space travel (in metric tonnes)
+local CollisionClearanceKm = 3 --export: minimum clearance radius from path to obstacles (km)
+local StopDist = 9 --km
 -- Auto Pilot
 local autoAlign = false
 local autoBrake = false
@@ -32,7 +33,8 @@ local __alignPitchCmd = 0
 
 Nav = Navigator.new(system, core, unit)
 Nav.axisCommandManager:setupCustomTargetSpeedRanges(axisCommandId.longitudinal, {1000, 5000, 10000, 20000, 30000})
-Nav.axisCommandManager:setTargetGroundAltitude(200)
+Nav.axisCommandManager:setTargetGroundAltitude(0)
+
 -- Default engine manager target speed ranges are not used
 -- Initialize axis modes and zero throttle to prevent unintended thrust
 if axisCommandId and axisCommandType then
@@ -72,7 +74,14 @@ end
 -- Conditional printer: only prints when printDebug is true,
 -- except always prints COMMAND REJECTED/ACCEPTED
 local function dprint(msg)
-    if msg == 'COMMAND REJECTED' or msg == 'COMMAND ACCEPTED' or msg == 'COMMAND COMPLETED' or msg == 'EMERGENCY STOP' or msg == 'PRIMED' or printDebug then
+    if msg == 'COMMAND ACCEPTED' or
+       msg == 'COMMAND REJECTED' or
+       msg == 'COMMAND COMPLETED' or
+       msg == 'OBSTACLE DETECTED' or
+       msg == 'EMERGENCY STOP' or
+       msg == 'INSUFFICIENT FUEL' or
+       msg == 'PRIMED' or
+       printDebug then
         system.print(msg)
     end
 end
@@ -149,6 +158,49 @@ local function hasMinSpaceFuelKg(minT)
     return totalKg >= (minKg or 0)
 end
 
+-- Collision checking helpers (use optional |scope| API if present)
+
+local function getObstacleWorldPositions()
+    local positions = {}
+    local sc = _G.scope or scope -- allow either global reference
+    if not sc then return positions end
+    -- Support both possible spellings per user note
+    local getIds = sc.getConstrcutIds or sc.getConstructIds
+    local getPos = sc.getConstrcutWorldPos or sc.getConstructWorldPos
+    if type(getIds) ~= 'function' or type(getPos) ~= 'function' then return positions end
+    local okIds, ids = pcall(getIds)
+    if not okIds or type(ids) ~= 'table' then return positions end
+    for _, id in pairs(ids) do
+        local okP, p = pcall(getPos, id)
+        if okP and p then
+            local x = p.x or p[1]; local y = p.y or p[2]; local z = p.z or p[3]
+            if x and y and z then table.insert(positions, vec3(x, y, z)) end
+        end
+    end
+    return positions
+end
+
+-- Return true if any obstacle lies within a cylinder of radius |clearanceM| along segment P0->P1
+local function hasObstacleAlongPath(P0, P1, clearanceM)
+    if not P0 or not P1 then return false end
+    local obstacles = getObstacleWorldPositions()
+    if #obstacles == 0 then return false end
+    local seg = v3sub(P1, P0)
+    local segLen2 = seg:dot(seg)
+    if segLen2 <= 1e-6 then return false end
+    local r2 = (clearanceM or 0)^2
+    for _, O in ipairs(obstacles) do
+        local OP0 = v3sub(O, P0)
+        local t = OP0:dot(seg) / segLen2
+        if t >= 0 and t <= 1 then
+            local closest = P0 + seg * t
+            local d2 = v3sub(O, closest):dot(v3sub(O, closest))
+            if d2 <= r2 then return true end
+        end
+    end
+    return false
+end
+
 -- Autopilot state for destination engagement
 local __ap_active = false
 local __ap_phase = 'idle' -- 'idle'|'align'|'cruise'|'brake'|'done'
@@ -213,7 +265,7 @@ local function __ap_setThrottle01(val)
     -- Prefer using the axis command manager as requested
     if lon >= 0.5 then
         -- Increase throttle (simulate action start)
-        Nav.axisCommandManager:updateCommandFromActionStart(axisCommandId.longitudinal, 1000)
+        Nav.axisCommandManager:updateCommandFromActionStart(axisCommandId.longitudinal, 10000)
         -- Optional: reflect in the cockpit widget
         unit.setAxisCommandValue(axisCommandId.longitudinal, 1)
     else
@@ -231,6 +283,16 @@ local function __ap_start()
     if enviro then
         dprint('Autopilot: not starting in atmosphere')
         return
+    end
+    -- Pre-launch collision check: reject if any obstacle lies along the path
+    do
+        local P0 = vec3(construct.getWorldPosition())
+        local clr = (CollisionClearanceKm or 0) * 1000
+        if hasObstacleAlongPath(P0, __destPos, clr) then
+            dprint('COMMAND REJECTED')
+            dprint('Obstacle detected along path')
+            return
+        end
     end
 
     -- Proximity safety: reject destinations near planets when AllowAtmo=false
@@ -252,15 +314,16 @@ local function __ap_start()
     else
         -- Enforce minimum space fuel requirement (60t)
         if not hasMinSpaceFuelKg(FuelForBurn) then
-            dprint('COMMAND REJECTED')
+            dprint('INSUFFICIENT FUEL')
             dprint('Insufficient space fuel (<60t)')
             return
+        else
+            __ap_phase = 'align'
         end
     end
 
     
     __ap_active = true
-    __ap_phase = 'align'
     __ap_startedAt = nowTime()
     __ap_alignHoldSince = 0
     __ap_lastSpeed = 0
@@ -737,83 +800,6 @@ system:onEvent('onFlush', function (self)
         end
     end
 
-    -- Compute HUD values
-    do
-        local vdir = constructVelocityDir
-        local fwd = vec3(construct.getWorldOrientationForward())
-        local dotv = clamp(vdir:dot(fwd), -1, 1)
-        local aoa = math.deg(math.acos(dotv)) -- 0..180
-        aoa = math.min(aoa, 45)
-        stallScaled = math.floor((aoa / 45) * 60 + 0.5)
-    end
-
-    do
-        if __destPos then
-            local pos = vec3(construct.getWorldPosition())
-            local toDest = v3sub(__destPos, pos)
-            local up = vec3(construct.getWorldOrientationUp())
-            local right = vec3(construct.getWorldOrientationRight())
-            -- Project destination vector onto horizontal plane (azimuth only)
-            local toFlat = toDest - up * toDest:dot(up)
-            local toStraight = toDest - right * toDest:dot(right)
-            local len = toFlat:len()
-            local narrow = toStraight:len()
-            if len > 1e-6 then
-                toFlat = toFlat / len
-                local fwd = vec3(construct.getWorldOrientationForward())
-                local right = vec3(construct.getWorldOrientationRight())
-                local x = toFlat:dot(fwd)
-                local y = toFlat:dot(right)
-                local yawDeg = math.deg(math.atan(y, x)) -- signed, -180..180
-                -- Clamp to +/-90 for scale window
-                local dev = math.max(-90, math.min(90, yawDeg))
-                headingScaled = math.floor((dev / 90) * 130 + 0.5)
-            end
-            if narrow > 1e-6 then
-                toStraight = toStraight / narrow
-                local fwd = vec3(construct.getWorldOrientationForward())
-                local up = vec3(construct.getWorldOrientationUp())
-                local x = toStraight:dot(fwd)
-                local y = toStraight:dot(up)
-                local pitchDeg = math.deg(math.atan(y, x)) -- signed, -180..180
-                local clamped = clamp(pitchDeg, -45, 45)   -- limit to +/-45
-                local scaled = (clamped + 45) / 90         -- normalize to 0..1
-                climbScaled = math.floor(scaled * 110 + 0.5)
-            end
-        end
-    end
-
-    do
-        local fwd = vec3(construct.getWorldOrientationForward())
-        velocity = constructVelocity:dot(fwd) * 3.6 -- km/h along forward
-        if velocity < 0 then velocity = 0 end
-        local s = math.min(velocity, 1000) / 1000 * 110
-        speedScaled = math.floor(s + 0.5)
-    end
-
-    do
-        local pos = vec3(construct.getWorldPosition())
-        local nearestDist = math.huge
-        local nearestRadius = 0
-        for sysId, sys in pairs(atlas) do
-            if type(sys) == 'table' then
-                for bodyId, body in pairs(sys) do
-                    if type(body) == 'table' and body.center then
-                        local c = body.center
-                        local d = v3sub(pos, vec3(c[1], c[2], c[3])):len()
-                        if d < nearestDist then
-                            nearestDist = d
-                            nearestRadius = body.radius or 0
-                        end
-                    end
-                end
-            end
-        end
-        altM = math.max(nearestDist - nearestRadius, 0)
-        local s = math.min(altM, 3500) / 3500 * 110
-        altScaled = math.floor(s + 0.5)
-    end
-
     do
         if __destPos then
             local pos = vec3(construct.getWorldPosition())
@@ -945,7 +931,21 @@ system:onEvent('onFlush', function (self)
 
 end)
 
+-- During autopilot, check for newly encountered obstacles and emergency stop if collision likely
+system:onEvent('onEnter', function(self)
+    if __ap_active and __destPos and not enviro then
+        local P0 = vec3(construct.getWorldPosition())
+        local clr = (CollisionClearanceKm or 0) * 1000
+        if hasObstacleAlongPath(P0, __destPos, clr) then
+            __emg_allstop_active = true
+            dprint('OBSTACLE DETECTED')
+            dprint('EMERGENCY STOP')
+        end
+    end
+end)
+
 system:onEvent('onUpdate', function (self)
+    Nav:update()
     enviro = ((unit.getAtmosphereDensity() or 0) > 0)
     local v = vec3(construct.getWorldVelocity())
     shipspeed = math.sqrt(v.x * v.x + v.y * v.y + v.z * v.z)
@@ -986,14 +986,14 @@ system:onEvent('onUpdate', function (self)
         if isWorldInSpace(tele_sysId, __destPos) then
             if autoBrake and math.floor(distKm) < math.ceil(brakedist/1000) + StopDist and shipspeed > 10 then --kilometers
                 brakeInput = 1
-            elseif autoBrake and (shipspeed <= 0.5) then
+            elseif autoBrake and (shipspeed <= 1) then
                 brakeInput = 0
                 autoBrake = false
             end
         else
             if autoBrake and math.floor(distanceToDestAtmosphere()) < math.ceil(brakedist+49000) and shipspeed > 10 then --meters
                 brakeInput = 1
-            elseif autoBrake and (shipspeed <= 0.5) then
+            elseif autoBrake and (shipspeed <= 1) then
                 brakeInput = 0
                 autoBrake = false
             end
@@ -1026,6 +1026,8 @@ system:onEvent('onUpdate', function (self)
 
         if __ap_phase == 'align' then
             autoAlign = true
+            Nav.axisCommandManager:updateTargetGroundAltitudeFromActionLoop(1.0)
+
             -- consider aligned when within tolerance and stable briefly
             local tolDeg = 1.0
             if angleToDestDeg() <= tolDeg then
@@ -1033,7 +1035,7 @@ system:onEvent('onUpdate', function (self)
                 if (now - __ap_alignHoldSince) >= 0.5 then
                     -- Accelerate using raw throttle; enable auto-brake
                     __ap_setThrottle01(1)
-                    autoBrake = true
+                    autoAlign = false
                     dprint('Autopilot: aligned; throttle max with auto-brake')
                     __ap_phase = 'cruise'
                     __ap_lastSpeed = shipspeed or 0
@@ -1045,6 +1047,7 @@ system:onEvent('onUpdate', function (self)
 
         elseif __ap_phase == 'cruise' then
             -- Detect max speed reached using construct.getMaxSpeed()
+            Nav.axisCommandManager:updateTargetGroundAltitudeFromActionLoop(-1.0)
             local maxSpd = (construct.getMaxSpeed and construct.getMaxSpeed()) or 0
             local atMax = false
             if maxSpd and maxSpd > 0 then
@@ -1065,6 +1068,7 @@ system:onEvent('onUpdate', function (self)
             if halfReached or atMax then
                 -- Begin braking phase: throttle to 0; auto-brake will handle decel near target
                 __ap_setThrottle01(0)
+                autoBrake = true
                 dprint('Autopilot: throttle 0; braking...')
                 __ap_phase = 'brake'
             end
@@ -1094,6 +1098,7 @@ system:onEvent('onUpdate', function (self)
         elseif __ap_phase == 'approach_align' then
             -- Re-align precisely before gentle approach thrust
             autoAlign = true
+            Nav.axisCommandManager:updateTargetGroundAltitudeFromActionLoop(1.0)
             local tolDeg = 1.0
             if angleToDestDeg() <= tolDeg then
                 if __ap_alignHoldSince == 0 then __ap_alignHoldSince = now end
@@ -1101,6 +1106,7 @@ system:onEvent('onUpdate', function (self)
                     -- Do not use target-speed mode; throttle-limited gentle approach
                     __ap_setThrottle01(1) -- engage throttle to start approach
                     __ap_phase = 'approach'
+                    autoAlign = false
                     dprint('Autopilot: gentle approach (<=200 km/h) with autobrake')
                 end
             else
@@ -1109,11 +1115,12 @@ system:onEvent('onUpdate', function (self)
 
         elseif __ap_phase == 'approach' then
             -- Keep aligning lightly and let autobrake stop near the target; cap speed without target-speed
-            autoAlign = true
+            --autoAlign = true
+            Nav.axisCommandManager:updateTargetGroundAltitudeFromActionLoop(-1.0)
             local distNowKm = (distanceToDestM() / 1000)
             if not autoBrake and distNowKm <= (1) and fullyStopped() then
                 -- Stop complete: exit
-                autoAlign = false
+                --autoAlign = false
                 __ap_phase = 'done'
                 dprint('Autopilot: arrived; exiting seat')
                 dprint('COMMAND COMPLETED')
